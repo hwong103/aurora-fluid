@@ -69,6 +69,7 @@
   <button type="button" data-act="palette" aria-pressed="false" title="Cycle dye palette">Palette</button>
   <button type="button" data-act="glow" aria-pressed="true" title="Toggle bloom glow">Glow</button>
   <button type="button" data-act="drift" aria-pressed="true" title="Toggle ambient drift">Drift</button>
+  <button type="button" data-act="quality" title="Cycle simulation quality manually">Q3</button>
   <button type="button" data-act="clear" title="Clear the canvas">Clear</button>
 </div>
 
@@ -421,8 +422,9 @@
   function destroyDouble(d) { if (d) { destroyFBO(d.read); destroyFBO(d.write); } }
 
   // The sim runs far coarser than the display — the single biggest performance
-  // lever, and visually indistinguishable for a flow this diffuse.
-  const SIM_RES = 128, DYE_RES = 512, BLOOM_RES = 256, MAX_SIDE = 1024;
+  // lever, and visually near-indistinguishable for a flow this diffuse.
+  // Exact sizes live in CFG.QUALITY so they can adapt to the host GPU.
+  const MAX_SIDE = 1024;
 
   let velocity, dye, divergence, curl, pressure, bloomA, bloomB;
   let dyeScratch = null;
@@ -438,9 +440,10 @@
   }
 
   function initFramebuffers() {
-    const [sw, sh] = resolutionFor(SIM_RES);
-    const [dw, dh] = resolutionFor(DYE_RES);
-    const [bw, bh] = resolutionFor(BLOOM_RES);
+    const q = CFG.QUALITY[CFG.qualityLevel];
+    const [sw, sh] = resolutionFor(q.sim);
+    const [dw, dh] = resolutionFor(q.dye);
+    const [bw, bh] = resolutionFor(q.bloom);
 
     destroyDouble(velocity); destroyDouble(dye); destroyDouble(pressure);
     destroyFBO(divergence); destroyFBO(curl); destroyFBO(bloomA); destroyFBO(bloomB);
@@ -486,7 +489,20 @@
     BLOOM_THRESHOLD: 0.35,
     BLOOM_SOFT_KNEE: 0.12,
     EXPOSURE: 1.0,
-    DRIFT: true
+    DRIFT: true,
+    // Adaptive quality. Target a 60fps budget and scale the expensive knobs
+    // to fit whatever GPU this actually lands on.
+    ADAPTIVE: true,
+    TARGET_FRAME_MS: 16.7,
+    // Quality tiers, cheapest first. Index is chosen at runtime.
+    QUALITY: [
+      { sim: 64,  dye: 256,  bloom: 128, pressure: 10, curl: 20, bloomIter: 3 },
+      { sim: 96,  dye: 384,  bloom: 192, pressure: 14, curl: 24, bloomIter: 4 },
+      { sim: 128, dye: 512,  bloom: 256, pressure: 20, curl: 26, bloomIter: 6 },
+      { sim: 160, dye: 768,  bloom: 320, pressure: 24, curl: 28, bloomIter: 8 }
+    ],
+    // Start mid-tier and let the governor climb or fall from there.
+    qualityLevel: 1
   };
 
   const PALETTES = [
@@ -564,7 +580,7 @@
     gl.uniform2f(P.vort.u.texel, 1 / vw, 1 / vh);
     gl.uniform1i(P.vort.u.uVelocity, velocity.read.attach(0));
     gl.uniform1i(P.vort.u.uCurl, curl.attach(1));
-    gl.uniform1f(P.vort.u.curl, CFG.CURL);
+    gl.uniform1f(P.vort.u.curl, CFG.QUALITY[CFG.qualityLevel].curl);
     gl.uniform1f(P.vort.u.dt, dt);
     blit(velocity.write);
     velocity.swap();
@@ -589,7 +605,7 @@
     blit(pressure.write);
     pressure.swap();
 
-    for (let i = 0; i < CFG.PRESSURE_ITERATIONS; i++) {
+    for (let i = 0; i < CFG.QUALITY[CFG.qualityLevel].pressure; i++) {
       gl.uniform1i(P.pressure.u.uPressure, pressure.read.attach(1));
       blit(pressure.write);
       pressure.swap();
@@ -670,7 +686,7 @@
 
     gl.useProgram(P.blur.p);
     gl.uniform2f(P.blur.u.texel, 1 / bloomA.width, 1 / bloomA.height);
-    for (let i = 0; i < CFG.BLOOM_ITERATIONS; i++) {
+    for (let i = 0; i < CFG.QUALITY[CFG.qualityLevel].bloomIter; i++) {
       gl.uniform1i(P.blur.u.uTexture, bloomA.attach(0));
       gl.uniform2f(P.blur.u.dir, 1, 0);
       blit(bloomB);
@@ -758,6 +774,19 @@
     buttons.drift.setAttribute('aria-pressed', String(CFG.DRIFT));
   });
 
+  // Clicking quality hands control to the user and stops the governor, so
+  // the two can never fight over the tier.
+  buttons.quality.textContent = 'Q' + CFG.qualityLevel;
+  buttons.quality.setAttribute('aria-pressed', 'true');
+
+  buttons.quality.addEventListener('click', () => {
+    CFG.ADAPTIVE = false;
+    buttons.quality.setAttribute('aria-pressed', 'false');
+    CFG.qualityLevel = (CFG.qualityLevel + 1) % CFG.QUALITY.length;
+    buttons.quality.textContent = 'Q' + CFG.qualityLevel;
+    initFramebuffers();
+  });
+
   buttons.clear.addEventListener('click', () => {
     gl.useProgram(P.clear.p);
     for (const target of [dye, velocity]) {
@@ -790,6 +819,35 @@
   let last = performance.now();
   let frame = 0;
 
+  // ── Adaptive quality governor ────────────────────────────────────────────
+  // rAF is vsync-locked, so a steady 60fps says nothing about whether headroom
+  // remains. Instead watch the CPU-side cost of stepping and rendering: if it
+  // is consistently over budget, drop a tier; if comfortably under, climb back.
+  // Hysteresis on both the threshold and a cooldown stops it oscillating.
+  const gov = { ema: CFG.TARGET_FRAME_MS, cooldown: 90 };
+  const governorProbe = new Uint8Array(4);
+
+  function governor(cpuMs) {
+    if (!CFG.ADAPTIVE) return;
+    gov.ema += (cpuMs - gov.ema) * 0.1;
+    if (--gov.cooldown > 0) return;
+
+    if (gov.ema > CFG.TARGET_FRAME_MS * 1.35 && CFG.qualityLevel > 0) {
+      CFG.qualityLevel--;
+      gov.cooldown = 150;
+      gov.ema = CFG.TARGET_FRAME_MS;
+      initFramebuffers();
+      buttons.quality.textContent = 'Q' + CFG.qualityLevel;
+    } else if (gov.ema < CFG.TARGET_FRAME_MS * 0.55 &&
+               CFG.qualityLevel < CFG.QUALITY.length - 1) {
+      CFG.qualityLevel++;
+      gov.cooldown = 300;
+      gov.ema = CFG.TARGET_FRAME_MS;
+      initFramebuffers();
+      buttons.quality.textContent = 'Q' + CFG.qualityLevel;
+    }
+  }
+
   function loop(now) {
     // Clamp dt: a backgrounded tab or a long GC pause must not teleport the sim.
     const dt = Math.min((now - last) / 1000, 1 / 30);
@@ -806,8 +864,14 @@
             Math.cos(a + 1.4) * 260, Math.sin(a + 1.4) * 260, nextColor());
     }
 
+    const t0 = performance.now();
     step(dt);
     render();
+    // GL commands are queued asynchronously, so timing the JS alone measures
+    // almost nothing. A 1x1 readPixels forces a pipeline flush, making the
+    // elapsed time include the GPU work that was just issued.
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, governorProbe);
+    governor(performance.now() - t0);
     requestAnimationFrame(loop);
   }
 
