@@ -260,9 +260,12 @@
     void main() {
       vec3 c = texture2D(uTexture, vUv).rgb;
       float br = max(max(c.r, c.g), c.b);
-      float soft = clamp(br - threshold + knee, 0.0, 2.0 * knee);
-      soft = soft * soft / (4.0 * knee + 0.0001);
-      gl_FragColor = vec4(c * max(soft, br - threshold) / max(br, 0.0001), 1.0);
+      // Quadratic soft knee. The curve must fall to exactly 0 at br = threshold,
+       // otherwise near-black dye gets amplified into a white haze.
+      float rq = clamp(br - threshold + knee, 0.0, 2.0 * knee);
+      rq = rq * rq / (4.0 * knee + 1e-5);
+      float contrib = max(rq, br - threshold) / max(br, 1e-5);
+      gl_FragColor = vec4(c * contrib, 1.0);
     }`;
 
   const FS_BLUR = HEAD + `
@@ -413,21 +416,25 @@
 
   // ── Tuning ───────────────────────────────────────────────────────────────
   const CFG = {
-    DENSITY_DISSIPATION: 0.55,
+    // Dye is injected additively, so dissipation sets the equilibrium. Too low
+    // and the field saturates to white; too high and strokes vanish instantly.
+    DENSITY_DISSIPATION: 1.0,
     VELOCITY_DISSIPATION: 0.2,
     PRESSURE: 0.8,
     PRESSURE_ITERATIONS: 20,
     CURL: 26,
     SPLAT_RADIUS: 0.0052,
-    // Dye is injected well above 1.0 so the tone-mapped result stays saturated
-    // and the bloom bright-pass has something to work with.
-    SPLAT_DYE_GAIN: 2.6,
+    // Keep the steady-state peak near 1.0 so the tone-mapped result stays in
+    // the range where hue survives instead of clipping to white.
+    SPLAT_DYE_GAIN: 1.6,
     SPLAT_FORCE: 5600,
     BLOOM: true,
     BLOOM_ITERATIONS: 6,
     BLOOM_INTENSITY: 0.6,
-    BLOOM_THRESHOLD: 0.04,
-    BLOOM_SOFT_KNEE: 0.6,
+    // The knee must be well under the threshold, or the soft curve never
+    // reaches zero and lifts the whole frame into a grey haze.
+    BLOOM_THRESHOLD: 0.35,
+    BLOOM_SOFT_KNEE: 0.12,
     EXPOSURE: 1.0,
     DRIFT: true
   };
