@@ -297,8 +297,13 @@
 
   // Dye splats use a soft ceiling. A finger held in one place keeps pumping
   // dye in; without a limit the interior of a slow drag saturates every
-  // channel and the tone-map turns it flat white. Approaching a ceiling
-  // asymptotically keeps colour instead of clipping it.
+  // channel and the tone-map turns it flat white.
+  //
+  // The rolloff scales the whole RGB vector by one factor, so the ratios
+  // between channels -- and therefore the hue -- survive untouched. A
+  // per-channel ceiling is the trap here: it squeezes a bright channel and a
+  // dim one toward the same number, which drains the colour out of the very
+  // stroke the ceiling was meant to protect.
   const FS_SPLAT_DYE = HEAD + `
     uniform sampler2D uTarget;
     uniform float aspect, radius, ceiling;
@@ -309,15 +314,15 @@
       p.x *= aspect;
       vec3 base = texture2D(uTarget, vUv).rgb;
       vec3 add = exp(-dot(p, p) / radius) * color;
-      // Soft-knee rolloff: no effect well below the ceiling, saturating above.
       vec3 sum = base + add;
-      // Below the knee nothing changes. Above it the value is compressed
-      // toward the ceiling, so the interior of a slow drag saturates gently
-      // instead of running away to white.
-      float knee = ceiling * 0.92;
-      vec3 over = max(sum - knee, vec3(0.0));
-      vec3 limited = knee + over / (1.0 + over / max(ceiling - knee, 1e-3));
-      gl_FragColor = vec4(clamp(mix(sum, limited, step(knee, sum)), 0.0, ceiling), 1.0);
+      float knee = ceiling * 0.94;
+      float mag = max(max(sum.r, sum.g), sum.b);
+      if (mag > knee) {
+        float over = mag - knee;
+        float limited = knee + over / (1.0 + over / max(ceiling - knee, 1e-3));
+        sum *= limited / max(mag, 1e-5);
+      }
+      gl_FragColor = vec4(sum, 1.0);
     }`;
 
   const FS_CLEAR = HEAD + `
@@ -569,14 +574,24 @@
     return [f(0), f(8), f(4)];
   }
 
-  // Hue advances a real step per splat and also drifts with time, so a single
-  // drag lays down a gradient rather than one flat colour.
+  // Hue advances across a stroke, so a drag lays down a gradient rather than
+  // one flat colour.
+  //
+  // The sweep is measured from the colour the stroke started with, not from
+  // wherever the previous stroke happened to leave the global wheel. Splat
+  // footprints overlap heavily -- a slow drag stacks about a dozen of them
+  // inside one texel -- so a free-running hue puts nearly the whole colour
+  // wheel into every single texel. Summing wheel-wide hues lifts R, G and B
+  // together, the stroke converges on grey, and the tone-map renders that as
+  // white. Measured from the stroke's own start, the overlapping splats stay
+  // in one arc of the wheel and the stroke keeps its colour.
   let hue = PALETTES[0].base;
+  let strokeHue = PALETTES[0].base;
   let hueClock = 0;
   function nextColor() {
     const pal = PALETTES[paletteIndex];
     if (pal.spread >= 0.99) {
-      hue = (hue + 0.055 + Math.random() * 0.075) % 1;
+      hue = (hue + 0.012 + Math.random() * 0.02) % 1;
     } else {
       hue += (Math.random() - 0.5) * pal.spread * 0.5;
       hue += pal.spread * 0.02;
@@ -587,6 +602,26 @@
     const s = Math.min(1, pal.sat * (0.86 + Math.random() * 0.24));
     const l = pal.lum * (0.86 + Math.random() * 0.28);
     return hslToRgb(hue + hueClock, s, l);
+  }
+
+  // Ambient colour for the idle drift. It rotates steadily across the whole
+  // wheel so the background keeps changing, but it is applied as one colour
+  // per drift splat, and drift splats land far apart, so it never stacks a
+  // dozen unrelated hues into a single texel the way a drag does.
+  let driftHue = 0;
+  function driftColor() {
+    driftHue = (driftHue + 0.02) % 1;
+    return hslToRgb(driftHue, 0.8, 0.55);
+  }
+
+  // Start a fresh sweep from a new colour, so consecutive strokes are clearly
+  // distinct rather than each continuing the last one's trail.
+  function newStroke() {
+    const pal = PALETTES[paletteIndex];
+    strokeHue = pal.spread >= 0.99
+      ? Math.random()
+      : pal.base + (Math.random() * 2 - 1) * pal.spread;
+    hue = strokeHue;
   }
 
   // ── Splats ───────────────────────────────────────────────────────────────
@@ -783,6 +818,7 @@
     // survivable, so never let it break the gesture.
     try { canvas.setPointerCapture?.(e.pointerId); } catch (_) { /* non-fatal */ }
     pointers.set(e.pointerId, normalise(e));
+    newStroke();
     dismissHint();
   });
 
@@ -809,7 +845,7 @@
 
   buttons.palette.addEventListener('click', () => {
     paletteIndex = (paletteIndex + 1) % PALETTES.length;
-    hue = PALETTES[paletteIndex].base;
+    newStroke();
     buttons.palette.textContent = PALETTES[paletteIndex].name;
     buttons.palette.setAttribute('aria-pressed', 'true');
     buttons.palette.setAttribute('aria-label',
@@ -926,7 +962,7 @@
       const a = Math.random() * Math.PI * 2;
       const r = 0.2 + Math.random() * 0.3;
       splat(0.5 + Math.cos(a) * r * 0.75, 0.5 + Math.sin(a) * r,
-            Math.cos(a + 1.4) * 260, Math.sin(a + 1.4) * 260, nextColor());
+            Math.cos(a + 1.4) * 260, Math.sin(a + 1.4) * 260, driftColor());
     }
 
     const t0 = performance.now();

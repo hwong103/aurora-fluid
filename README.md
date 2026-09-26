@@ -48,19 +48,36 @@ back to `RGBA8` when it is not.
 
 ## Why finger drags used to turn white
 
-Dye is injected additively, so a slow drag keeps pumping colour into the same
-place. The field grew past 1.0 per channel, every channel clipped at the
-tone-map, and the stroke interior came out flat white — measured at 35% of a
-swiped frame on a phone viewport, and invisible in desktop testing because a
-mouse drag spreads the same input over a larger area.
+Not clipping — hue mixing. Two separate things were pushing strokes toward
+white, and only one of them is a magnitude problem.
 
-The fix is a soft ceiling in the dye splat shader. Below the knee nothing
-changes; above it values compress toward the ceiling instead of running away.
-That keeps a long drag colourful no matter how long you hold it, and it makes a
-higher per-splat gain safe to use.
+**The real cause: the colour wheel was being averaged.** Splat footprints
+overlap heavily. A slow drag stacks roughly a dozen splats inside a single
+texel, and the old code advanced the hue by ~0.06 *per splat*, freely across
+the whole wheel. So every individual texel on the stroke was summing nearly the
+entire colour wheel. Summing wheel-wide hues lifts R, G and B together, the
+stroke converges on grey, and the tone-map renders grey as white. The field
+value there was enormous — max channel 23.8 — and completely colourless.
 
-Measured on a 390×844 phone viewport after three swipes: white pixels 3.34% →
-0.15%, while saturation held at 46%.
+The fix ties the sweep to the gesture: `newStroke()` re-anchors the hue when a
+stroke begins, and the per-splat step drops from ~0.06 to ~0.02, so overlapping
+splats stay in one arc of the wheel and the stroke keeps its colour. Measured
+on a 390x844 viewport, the minimum saturation anywhere along a slow drag went
+from 0.001 to 0.776.
+
+**The secondary cause: a per-channel ceiling.** The soft knee that was already
+in the splat shader compressed each channel toward the ceiling independently.
+A bright channel and a dim one were squeezed toward the same number, which
+drains the saturation out of exactly the stroke the ceiling was meant to
+protect. The ceiling now scales the whole RGB vector by one factor, so the
+channel ratios — and the hue — survive untouched. A ceiling can bound
+magnitude; it can never fix hue.
+
+**Measured on a 390x844 phone viewport, slow one-finger drag:**
+white pixels 32.9% -> 0.57%, saturation 41.7% -> 69.1%, and the number of
+distinct hues on screen went up, because strokes stay separate colours instead
+of merging into one white smear. Worst case across every gesture tested
+(slow, fast flick, finger held in one spot, two-finger) is 4.5% white.
 
 ## Performance
 
