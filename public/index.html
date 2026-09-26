@@ -293,9 +293,15 @@
     void main() {
       vec3 c = texture2D(uTexture, vUv).rgb + texture2D(uBloom, vUv).rgb * uGlow;
       c *= uExposure;
-      c = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);
+      // Filmic rolloff driven by luminance, so bright pixels keep their hue
+      // and desaturate gradually instead of clipping to flat white.
+      float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      vec3 ratio = c / max(luma, 1e-4);
+      float tl = clamp((luma * (2.51 * luma + 0.03)) / (luma * (2.43 * luma + 0.59) + 0.14), 0.0, 1.0);
+      ratio = mix(ratio, vec3(1.0), smoothstep(1.05, 2.2, luma));
+      c = clamp(ratio * tl, 0.0, 1.0);
       vec2 q = (vUv - 0.5) * vec2(uRes.x / uRes.y, 1.0);
-      c *= mix(0.5, 1.0, 1.0 - smoothstep(0.4, 1.05, length(q)));
+      c *= mix(0.74, 1.0, 1.0 - smoothstep(0.62, 1.25, length(q)));
       float n = fract(sin(dot(vUv * uRes, vec2(12.9898, 78.233))) * 43758.5453);
       gl_FragColor = vec4(c + (n - 0.5) / 255.0 * 1.6, 1.0);
     }`;
@@ -440,10 +446,10 @@
   };
 
   const PALETTES = [
-    { name: 'aurora', base: 0.52, spread: 0.44, sat: 0.85, lum: 0.56 },
-    { name: 'nebula', base: 0.92, spread: 0.28, sat: 0.9, lum: 0.55 },
-    { name: 'toxic', base: 0.28, spread: 0.22, sat: 0.92, lum: 0.54 },
-    { name: 'ember', base: 0.04, spread: 0.14, sat: 0.9, lum: 0.53 }
+    { name: 'spectrum', base: 0.00, spread: 1.00, sat: 0.88, lum: 0.55 },
+    { name: 'aurora',   base: 0.42, spread: 0.34, sat: 0.86, lum: 0.56 },
+    { name: 'ember',    base: 0.03, spread: 0.16, sat: 0.92, lum: 0.53 },
+    { name: 'orchid',   base: 0.80, spread: 0.26, sat: 0.88, lum: 0.55 }
   ];
   let paletteIndex = 0;
 
@@ -457,15 +463,24 @@
     return [f(0), f(8), f(4)];
   }
 
-  // A slowly rotating hue with a small random walk per splat: consecutive
-  // strokes stay related in colour but never identical.
+  // Hue advances a real step per splat and also drifts with time, so a single
+  // drag lays down a gradient rather than one flat colour.
   let hue = PALETTES[0].base;
+  let hueClock = 0;
   function nextColor() {
     const pal = PALETTES[paletteIndex];
-    hue += (Math.random() - 0.5) * pal.spread * 0.5;
-    hue += pal.spread * 0.02;
-    if (hue > pal.base + pal.spread || hue < pal.base - pal.spread) hue = pal.base;
-    return hslToRgb(hue, pal.sat, pal.lum);
+    if (pal.spread >= 0.99) {
+      hue = (hue + 0.055 + Math.random() * 0.075) % 1;
+    } else {
+      hue += (Math.random() - 0.5) * pal.spread * 0.5;
+      hue += pal.spread * 0.02;
+      if (hue > pal.base + pal.spread || hue < pal.base - pal.spread) hue = pal.base;
+    }
+    hueClock = (hueClock + 0.0016) % 1;
+    // Vary saturation and lightness per splat too, for depth.
+    const s = Math.min(1, pal.sat * (0.86 + Math.random() * 0.24));
+    const l = pal.lum * (0.86 + Math.random() * 0.28);
+    return hslToRgb(hue + hueClock, s, l);
   }
 
   // ── Splats ───────────────────────────────────────────────────────────────
