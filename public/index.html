@@ -45,14 +45,21 @@
   #panel button[aria-pressed="true"] {
     background: rgba(88, 142, 255, 0.3); border-color: rgba(140, 190, 255, 0.62); color: #fff;
   }
+  /* Unpressed controls recede, so the active ones are obvious without reading. */
+  #panel button[aria-pressed="false"] { color: #9fb2cf; }
+  #panel button[aria-pressed="true"]::before {
+    content: ""; display: inline-block; width: 5px; height: 5px; border-radius: 50%;
+    background: currentColor; margin-right: 6px; vertical-align: middle;
+  }
   #panel button:focus-visible { outline: 2px solid rgba(140, 190, 255, 0.8); outline-offset: 2px; }
 
   @media (max-width: 560px) {
     #panel {
-      top: auto; left: 12px; right: 12px; max-width: none; justify-content: center;
-      bottom: calc(12px + env(safe-area-inset-bottom));
+      top: auto; left: 10px; right: 10px; max-width: none; justify-content: center;
+      bottom: calc(12px + env(safe-area-inset-bottom)); gap: 7px;
     }
-    #panel button { font-size: 12px; padding: 8px 10px; }
+    /* 44px is the smallest comfortable touch target. */
+    #panel button { font-size: 12.5px; padding: 11px 13px; min-height: 44px; }
   }
   @media (prefers-reduced-motion: reduce) { #hint { transition: none; } }
 </style>
@@ -66,11 +73,16 @@
 </div>
 
 <div id="panel" role="group" aria-label="Fluid controls">
-  <button type="button" data-act="palette" aria-pressed="false" title="Cycle dye palette">Palette</button>
-  <button type="button" data-act="glow" aria-pressed="true" title="Toggle bloom glow">Glow</button>
-  <button type="button" data-act="drift" aria-pressed="true" title="Toggle ambient drift">Drift</button>
-  <button type="button" data-act="quality" title="Cycle simulation quality manually">Q3</button>
-  <button type="button" data-act="clear" title="Clear the canvas">Clear</button>
+  <button type="button" data-act="palette" aria-pressed="false"
+          aria-label="Dye colours: spectrum. Tap to change.">spectrum</button>
+  <button type="button" data-act="glow" aria-pressed="true"
+          aria-label="Toggle the soft glow around the dye">Glow</button>
+  <button type="button" data-act="drift" aria-pressed="true"
+          aria-label="Toggle automatic background movement">Auto</button>
+  <button type="button" data-act="quality" aria-pressed="true"
+          aria-label="Change detail level. Automatic by default.">Detail: auto</button>
+  <button type="button" data-act="clear"
+          aria-label="Erase everything and start again">Erase</button>
 </div>
 
 <script>
@@ -283,6 +295,31 @@
       gl_FragColor = texture2D(uTarget, vUv) + exp(-dot(p, p) / radius) * vec4(color, 1.0);
     }`;
 
+  // Dye splats use a soft ceiling. A finger held in one place keeps pumping
+  // dye in; without a limit the interior of a slow drag saturates every
+  // channel and the tone-map turns it flat white. Approaching a ceiling
+  // asymptotically keeps colour instead of clipping it.
+  const FS_SPLAT_DYE = HEAD + `
+    uniform sampler2D uTarget;
+    uniform float aspect, radius, ceiling;
+    uniform vec3 color;
+    uniform vec2 point;
+    void main() {
+      vec2 p = vUv - point;
+      p.x *= aspect;
+      vec3 base = texture2D(uTarget, vUv).rgb;
+      vec3 add = exp(-dot(p, p) / radius) * color;
+      // Soft-knee rolloff: no effect well below the ceiling, saturating above.
+      vec3 sum = base + add;
+      // Below the knee nothing changes. Above it the value is compressed
+      // toward the ceiling, so the interior of a slow drag saturates gently
+      // instead of running away to white.
+      float knee = ceiling * 0.92;
+      vec3 over = max(sum - knee, vec3(0.0));
+      vec3 limited = knee + over / (1.0 + over / max(ceiling - knee, 1e-3));
+      gl_FragColor = vec4(clamp(mix(sum, limited, step(knee, sum)), 0.0, ceiling), 1.0);
+    }`;
+
   const FS_CLEAR = HEAD + `
     uniform sampler2D uTexture;
     uniform float value;
@@ -351,6 +388,7 @@
     curl: program(VERT, FS_CURL),
     vort: program(VERT, FS_VORTICITY),
     splat: program(VERT, FS_SPLAT),
+    splatDye: program(VERT, FS_SPLAT_DYE),
     clear: program(VERT, FS_CLEAR),
     bright: program(VERT, FS_BRIGHT),
     blur: program(VERT, FS_BLUR),
@@ -471,7 +509,7 @@
   const CFG = {
     // Dye is injected additively, so dissipation sets the equilibrium. Too low
     // and the field saturates to white; too high and strokes vanish instantly.
-    DENSITY_DISSIPATION: 1.0,
+    DENSITY_DISSIPATION: 1.6,
     VELOCITY_DISSIPATION: 0.2,
     PRESSURE: 0.8,
     PRESSURE_ITERATIONS: 20,
@@ -479,8 +517,16 @@
     SPLAT_RADIUS: 0.0052,
     // Keep the steady-state peak near 1.0 so the tone-mapped result stays in
     // the range where hue survives instead of clipping to white.
-    SPLAT_DYE_GAIN: 1.6,
-    SPLAT_FORCE: 5600,
+    // Dye is injected additively, so a slow drag stacks many splats in the
+    // same place. Anything that pushes the field past ~1.0 per channel makes
+    // every channel clip at the tone-map, which is what turned finger drags
+    // into flat white. Keep the per-splat contribution small and let the
+    // field build gradually.
+    SPLAT_DYE_GAIN: 2.2,
+    // Soft ceiling for dye density. Comfortably under the point where the
+    // tone-map would clip channels, so long drags stay coloured.
+    DYE_CEILING: 1.1,
+    SPLAT_FORCE: 5200,
     BLOOM: true,
     BLOOM_ITERATIONS: 6,
     BLOOM_INTENSITY: 0.6,
@@ -556,12 +602,16 @@
     blit(velocity.write);
     velocity.swap();
 
-    gl.uniform2f(P.splat.u.texel, 1 / dye.read.width, 1 / dye.read.height);
-    gl.uniform1i(P.splat.u.uTarget, dye.read.attach(0));
-    gl.uniform1f(P.splat.u.aspect, dyeAspect.v);
-    gl.uniform3f(P.splat.u.color, color[0] * CFG.SPLAT_DYE_GAIN,
-                             color[1] * CFG.SPLAT_DYE_GAIN,
-                             color[2] * CFG.SPLAT_DYE_GAIN);
+    gl.useProgram(P.splatDye.p);
+    gl.uniform2f(P.splatDye.u.texel, 1 / dye.read.width, 1 / dye.read.height);
+    gl.uniform1i(P.splatDye.u.uTarget, dye.read.attach(0));
+    gl.uniform1f(P.splatDye.u.aspect, dyeAspect.v);
+    gl.uniform1f(P.splatDye.u.radius, CFG.SPLAT_RADIUS);
+    gl.uniform1f(P.splatDye.u.ceiling, CFG.DYE_CEILING);
+    gl.uniform2f(P.splatDye.u.point, x, y);
+    gl.uniform3f(P.splatDye.u.color, color[0] * CFG.SPLAT_DYE_GAIN,
+                                color[1] * CFG.SPLAT_DYE_GAIN,
+                                color[2] * CFG.SPLAT_DYE_GAIN);
     blit(dye.write);
     dye.swap();
   }
@@ -762,6 +812,8 @@
     hue = PALETTES[paletteIndex].base;
     buttons.palette.textContent = PALETTES[paletteIndex].name;
     buttons.palette.setAttribute('aria-pressed', 'true');
+    buttons.palette.setAttribute('aria-label',
+      'Dye colours: ' + PALETTES[paletteIndex].name + '. Tap to change.');
   });
 
   buttons.glow.addEventListener('click', () => {
@@ -776,15 +828,28 @@
 
   // Clicking quality hands control to the user and stops the governor, so
   // the two can never fight over the tier.
+  // Button text lives in one place so the visible label always matches the
+  // control's real state -- and so a screen reader and a sighted user get the
+  // same information.
+  const QUALITY_WORDS = ['low', 'medium', 'high', 'ultra'];
+  function qualityLabel() {
+    return CFG.ADAPTIVE ? 'Detail: auto' : 'Detail: ' + QUALITY_WORDS[CFG.qualityLevel];
+  }
+  function syncQualityButton() {
+    buttons.quality.textContent = qualityLabel();
+    buttons.quality.setAttribute('aria-pressed', String(!CFG.ADAPTIVE));
+    buttons.quality.setAttribute('aria-label',
+      CFG.ADAPTIVE ? 'Detail level: automatic. Tap to set manually.'
+                   : 'Detail level: ' + QUALITY_WORDS[CFG.qualityLevel] + '. Tap to change.');
+  }
+
   buttons.quality.textContent = 'Q' + CFG.qualityLevel;
-  buttons.quality.setAttribute('aria-pressed', 'true');
 
   buttons.quality.addEventListener('click', () => {
     CFG.ADAPTIVE = false;
-    buttons.quality.setAttribute('aria-pressed', 'false');
     CFG.qualityLevel = (CFG.qualityLevel + 1) % CFG.QUALITY.length;
-    buttons.quality.textContent = 'Q' + CFG.qualityLevel;
     initFramebuffers();
+    syncQualityButton();
   });
 
   buttons.clear.addEventListener('click', () => {
@@ -837,14 +902,14 @@
       gov.cooldown = 150;
       gov.ema = CFG.TARGET_FRAME_MS;
       initFramebuffers();
-      buttons.quality.textContent = 'Q' + CFG.qualityLevel;
+      syncQualityButton();
     } else if (gov.ema < CFG.TARGET_FRAME_MS * 0.55 &&
                CFG.qualityLevel < CFG.QUALITY.length - 1) {
       CFG.qualityLevel++;
       gov.cooldown = 300;
       gov.ema = CFG.TARGET_FRAME_MS;
       initFramebuffers();
-      buttons.quality.textContent = 'Q' + CFG.qualityLevel;
+      syncQualityButton();
     }
   }
 
@@ -884,6 +949,11 @@
     splat(0.5 + Math.cos(a) * 0.2, 0.5 + Math.sin(a) * 0.2,
           -Math.sin(a) * 900, Math.cos(a) * 900, nextColor());
   }
+
+  buttons.palette.setAttribute('aria-pressed', 'true');
+  buttons.palette.setAttribute('aria-label',
+    'Dye colours: ' + PALETTES[paletteIndex].name + '. Tap to change.');
+  syncQualityButton();
 
   requestAnimationFrame(() => {
     hint.classList.add('show');

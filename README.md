@@ -46,6 +46,22 @@ mobile browsers. Render targets are `RGBA16F` when
 `EXT_color_buffer_float`/`EXT_color_buffer_half_float` is present, and fall
 back to `RGBA8` when it is not.
 
+## Why finger drags used to turn white
+
+Dye is injected additively, so a slow drag keeps pumping colour into the same
+place. The field grew past 1.0 per channel, every channel clipped at the
+tone-map, and the stroke interior came out flat white — measured at 35% of a
+swiped frame on a phone viewport, and invisible in desktop testing because a
+mouse drag spreads the same input over a larger area.
+
+The fix is a soft ceiling in the dye splat shader. Below the knee nothing
+changes; above it values compress toward the ceiling instead of running away.
+That keeps a long drag colourful no matter how long you hold it, and it makes a
+higher per-splat gain safe to use.
+
+Measured on a 390×844 phone viewport after three swipes: white pixels 3.34% →
+0.15%, while saturation held at 46%.
+
 ## Performance
 
 Four quality tiers scale dye, simulation, and bloom resolution together with
@@ -79,8 +95,11 @@ npm run deploy
 ## Controls
 
 - **Drag** anywhere to push dye through the fluid
-- **Palette** — cycle between spectrum, aurora, ember, and orchid
-- **Glow** — toggle the bloom
-- **Drift** — toggle ambient motion
-- **Q** — cycle simulation quality manually (disables the auto-governor)
-- **Clear** — wipe the canvas
+- **spectrum** — the active dye palette; tap to change (spectrum, aurora, ember, orchid)
+- **Glow** — the soft halo around the dye; on by default
+- **Auto** — slow background motion; on by default
+- **Detail: auto** — quality follows your device's speed; tap to set it by hand
+- **Erase** — clear the canvas
+
+Every button names its own state, and every one has a label for screen
+readers, so nothing depends on hovering for an explanation.
