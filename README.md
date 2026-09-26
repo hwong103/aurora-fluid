@@ -113,6 +113,9 @@ npm run deploy
 
 - **Drag** anywhere to push dye through the fluid
 - **spectrum** — the active dye palette; tap to change (spectrum, aurora, ember, orchid)
+- **Flow: gentle** — how fast and how hard colour arrives; cycles
+  gentle → normal → wild. `gentle` is the default: a stroke eases in and
+  lingers instead of snapping to full strength.
 - **Glow** — the soft halo around the dye; on by default
 - **Auto** — slow background motion; on by default
 - **Detail: auto** — quality follows your device's speed; tap to set it by hand

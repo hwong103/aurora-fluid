@@ -75,6 +75,8 @@
 <div id="panel" role="group" aria-label="Fluid controls">
   <button type="button" data-act="palette" aria-pressed="false"
           aria-label="Dye colours: spectrum. Tap to change.">spectrum</button>
+  <button type="button" data-act="flow" aria-pressed="true"
+          aria-label="How quickly colour appears. Currently gentle.">Flow: gentle</button>
   <button type="button" data-act="glow" aria-pressed="true"
           aria-label="Toggle the soft glow around the dye">Glow</button>
   <button type="button" data-act="drift" aria-pressed="true"
@@ -541,6 +543,17 @@
     BLOOM_SOFT_KNEE: 0.12,
     EXPOSURE: 1.0,
     DRIFT: true,
+    // How fast and how hard colour arrives. These are multipliers on the base
+    // values above, not replacements, so the three levels stay in proportion.
+    // 'gentle' is the default: a stroke should bloom into place rather than
+    // snap to full strength on the first frame.
+    // 'fade' scales the dissipation rate, so a LOWER value lingers longer.
+    FLOW: [
+      { name: 'gentle', dye: 0.60, force: 0.62, bloom: 0.50, fade: 0.70 },
+      { name: 'normal', dye: 1.00, force: 1.00, bloom: 1.00, fade: 1.00 },
+      { name: 'wild',   dye: 1.45, force: 1.40, bloom: 1.45, fade: 1.35 }
+    ],
+    flowIndex: 0,
     // Adaptive quality. Target a 60fps budget and scale the expensive knobs
     // to fit whatever GPU this actually lands on.
     ADAPTIVE: true,
@@ -624,6 +637,11 @@
     hue = strokeHue;
   }
 
+  // The live flow preset. Read it in one place: the splat uniforms, the fade
+  // rate and the button label all have to agree, and three separate reads of
+  // CFG.flowIndex is how they drift apart.
+  function flow() { return CFG.FLOW[CFG.flowIndex]; }
+
   // ── Splats ───────────────────────────────────────────────────────────────
   function splat(x, y, dx, dy, color) {
     gl.useProgram(P.splat.p);
@@ -633,7 +651,8 @@
     gl.uniform1f(P.splat.u.aspect, simAspect.v);
     gl.uniform1f(P.splat.u.radius, CFG.SPLAT_RADIUS);
     gl.uniform2f(P.splat.u.point, x, y);
-    gl.uniform3f(P.splat.u.color, dx, dy, 0);
+    const f = flow();
+    gl.uniform3f(P.splat.u.color, dx * f.force, dy * f.force, 0);
     blit(velocity.write);
     velocity.swap();
 
@@ -644,9 +663,9 @@
     gl.uniform1f(P.splatDye.u.radius, CFG.SPLAT_RADIUS);
     gl.uniform1f(P.splatDye.u.ceiling, CFG.DYE_CEILING);
     gl.uniform2f(P.splatDye.u.point, x, y);
-    gl.uniform3f(P.splatDye.u.color, color[0] * CFG.SPLAT_DYE_GAIN,
-                                color[1] * CFG.SPLAT_DYE_GAIN,
-                                color[2] * CFG.SPLAT_DYE_GAIN);
+    gl.uniform3f(P.splatDye.u.color, color[0] * CFG.SPLAT_DYE_GAIN * f.dye,
+                                color[1] * CFG.SPLAT_DYE_GAIN * f.dye,
+                                color[2] * CFG.SPLAT_DYE_GAIN * f.dye);
     blit(dye.write);
     dye.swap();
   }
@@ -728,7 +747,7 @@
     gl.uniform1i(P.advect.u.uVelocity, velocity.read.attach(0));
     gl.uniform1i(P.advect.u.uSource, dye.read.attach(1));
     gl.uniform1f(P.advect.u.dt, dt);
-    gl.uniform1f(P.advect.u.dissipation, CFG.DENSITY_DISSIPATION);
+    gl.uniform1f(P.advect.u.dissipation, CFG.DENSITY_DISSIPATION * flow().fade);
     blit(dyeScratch[0]);
 
     // 2. Backward: advect that along +dt to find where it came from.
@@ -789,7 +808,7 @@
     gl.uniform2f(P.show.u.uRes, canvas.width, canvas.height);
     gl.uniform1i(P.show.u.uTexture, dye.read.attach(0));
     gl.uniform1i(P.show.u.uBloom, bloom.attach(1));
-    gl.uniform1f(P.show.u.uGlow, CFG.BLOOM_INTENSITY);
+    gl.uniform1f(P.show.u.uGlow, CFG.BLOOM_INTENSITY * flow().bloom);
     gl.uniform1f(P.show.u.uExposure, CFG.EXPOSURE);
     blit(null);
   }
@@ -850,6 +869,19 @@
     buttons.palette.setAttribute('aria-pressed', 'true');
     buttons.palette.setAttribute('aria-label',
       'Dye colours: ' + PALETTES[paletteIndex].name + '. Tap to change.');
+  });
+
+  // The label names the level in effect, so the control explains itself the
+  // same way the palette button does.
+  function syncFlowButton() {
+    const f = flow();
+    buttons.flow.textContent = 'Flow: ' + f.name;
+    buttons.flow.setAttribute('aria-label',
+      'How quickly colour appears. Currently ' + f.name + '. Tap to change.');
+  }
+  buttons.flow.addEventListener('click', () => {
+    CFG.flowIndex = (CFG.flowIndex + 1) % CFG.FLOW.length;
+    syncFlowButton();
   });
 
   buttons.glow.addEventListener('click', () => {
@@ -989,6 +1021,7 @@
   buttons.palette.setAttribute('aria-pressed', 'true');
   buttons.palette.setAttribute('aria-label',
     'Dye colours: ' + PALETTES[paletteIndex].name + '. Tap to change.');
+  syncFlowButton();
   syncQualityButton();
 
   requestAnimationFrame(() => {
