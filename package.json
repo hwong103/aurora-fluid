@@ -1,0 +1,14 @@
+{
+  "name": "aurora-fluid",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GPU-accelerated WebGL fluid simulation in a single HTML file",
+  "scripts": {
+    "dev": "wrangler pages dev public --profile personal",
+    "deploy": "wrangler deploy",
+    "preview": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.141.0"
+  }
+}
