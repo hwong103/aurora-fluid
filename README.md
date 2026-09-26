@@ -46,6 +46,22 @@ mobile browsers. Render targets are `RGBA16F` when
 `EXT_color_buffer_float`/`EXT_color_buffer_half_float` is present, and fall
 back to `RGBA8` when it is not.
 
+## Performance
+
+Four quality tiers scale dye, simulation, and bloom resolution together with
+pressure-iteration count, curl strength, and bloom iterations. A governor
+watches the real GPU cost of each frame and moves between tiers to hold a 60fps
+budget, with hysteresis and asymmetric cooldowns so it settles instead of
+oscillating.
+
+Measuring GPU cost takes a deliberate `readPixels` of one pixel after
+rendering. WebGL commands are queued asynchronously, so timing the JavaScript
+around the draw calls measures almost nothing — in practice about 0.09ms. The
+one-pixel read forces a pipeline flush, so the elapsed time includes the work
+the GPU actually did.
+
+Pressing the **Q** button takes manual control and disables the governor.
+
 ## Local development
 
 ```sh
@@ -63,7 +79,8 @@ npm run deploy
 ## Controls
 
 - **Drag** anywhere to push dye through the fluid
-- **Palette** — cycle between aurora, nebula, toxic, and ember
+- **Palette** — cycle between spectrum, aurora, ember, and orchid
 - **Glow** — toggle the bloom
 - **Drift** — toggle ambient motion
+- **Q** — cycle simulation quality manually (disables the auto-governor)
 - **Clear** — wipe the canvas
