@@ -26,6 +26,19 @@ The simulation grid (128) and dye grid (512) are deliberately much coarser
 than the display. That is the single biggest performance lever and it is
 visually indistinguishable for a flow this diffuse.
 
+The dye is advected with a **MacCormack** scheme rather than plain
+semi-Lagrangian advection. Plain semi-Lagrangian is stable but blurs: a thin
+filament of dye diffuses away within a few frames. MacCormack advects forward,
+advects that result backward, and applies the second-order correction, clamped
+to the neighbourhood the sample came from. It costs two extra passes and buys
+roughly 40% more visible detail in the dye.
+
+Colour is handled carefully in two places. The palette walks the full hue
+circle rather than a single family, so strokes read as a spectrum rather than
+various shades of blue. And the tone-map is driven by luminance rather than
+applied per channel, so bright dye desaturates gradually instead of clipping
+to flat white and taking its hue with it.
+
 ## Compatibility
 
 WebGL2 is used when available and WebGL1 otherwise, so the demo runs on older

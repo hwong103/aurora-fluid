@@ -160,7 +160,8 @@
     varying vec2 vUv, vL, vR, vT, vB;
     `;
 
-  // Semi-Lagrangian advection: unconditionally stable, so fast drags never blow up.
+  // First-order semi-Lagrangian advection, used as the forward half of a
+  // MacCormack step. Unconditionally stable, so fast drags never blow up.
   const FS_ADVECT = HEAD + `
     uniform sampler2D uVelocity, uSource;
     uniform vec2 texel;
@@ -168,6 +169,39 @@
     void main() {
       vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texel;
       gl_FragColor = texture2D(uSource, coord) / (1.0 + dissipation * dt);
+    }`;
+
+  // Backward half of the MacCormack step: advect the forward result along +dt
+  // to recover where each sample actually came from.
+  const FS_ADVECT_BACK = HEAD + `
+    uniform sampler2D uVelocity, uSource;
+    uniform vec2 texel;
+    uniform float dt;
+    void main() {
+      vec2 coord = vUv + dt * texture2D(uVelocity, vUv).xy * texel;
+      gl_FragColor = texture2D(uSource, coord);
+    }`;
+
+  // Second-order correction. Clamped to the neighbourhood it was sampled
+  // from, otherwise the extra accuracy shows up as ringing at sharp edges.
+  const FS_MCCORMACK = HEAD + `
+    uniform sampler2D uVelocity, uSource, uForward, uBackward;
+    uniform vec2 texel;
+    uniform float dt;
+    void main() {
+      vec2 v = texture2D(uVelocity, vUv).xy;
+      vec2 coord = vUv - dt * v * texel;
+      vec4 src = texture2D(uSource, vUv);
+      vec4 fwd = texture2D(uForward, vUv);
+      vec4 bwd = texture2D(uBackward, vUv);
+      vec4 corrected = fwd + 0.5 * (src - bwd);
+
+      vec4 s0 = texture2D(uSource, coord - vec2(texel.x, 0.0));
+      vec4 s1 = texture2D(uSource, coord + vec2(texel.x, 0.0));
+      vec4 s2 = texture2D(uSource, coord - vec2(0.0, texel.y));
+      vec4 s3 = texture2D(uSource, coord + vec2(0.0, texel.y));
+      gl_FragColor = clamp(corrected, min(min(s0, s1), min(s2, s3)),
+                                        max(max(s0, s1), max(s2, s3)));
     }`;
 
   const FS_DIVERGENCE = HEAD + `
@@ -308,6 +342,8 @@
 
   const P = {
     advect: program(VERT, FS_ADVECT),
+    advectBack: program(VERT, FS_ADVECT_BACK),
+    mccormack: program(VERT, FS_MCCORMACK),
     div: program(VERT, FS_DIVERGENCE),
     pressure: program(VERT, FS_PRESSURE),
     grad: program(VERT, FS_GRADIENT),
@@ -389,6 +425,7 @@
   const SIM_RES = 128, DYE_RES = 512, BLOOM_RES = 256, MAX_SIDE = 1024;
 
   let velocity, dye, divergence, curl, pressure, bloomA, bloomB;
+  let dyeScratch = null;
   const simAspect = { v: 1 }, dyeAspect = { v: 1 };
 
   function resolutionFor(base) {
@@ -415,6 +452,13 @@
     pressure = createDoubleFBO(sw, sh, FMT.internal, FMT.type, NEAREST);
     bloomA = createFBO(bw, bh, FMT.internal, FMT.type, FMT.filter);
     bloomB = createFBO(bw, bh, FMT.internal, FMT.type, FMT.filter);
+
+    // Scratch pair for the MacCormack dye pass.
+    if (dyeScratch) { destroyFBO(dyeScratch[0]); destroyFBO(dyeScratch[1]); }
+    dyeScratch = [
+      createFBO(dw, dh, FMT.internal, FMT.type, FMT.filter),
+      createFBO(dw, dh, FMT.internal, FMT.type, FMT.filter)
+    ];
 
     simAspect.v = sw / sh;
     dyeAspect.v = dw / dh;
@@ -567,11 +611,41 @@
     blit(velocity.write);
     velocity.swap();
 
+    advectDye(dt);
+  }
+
+  // MacCormack advection for the dye. First-order semi-Lagrangian smears
+  // thin filaments badly; the forward/backward/correct triple keeps them
+  // crisp for the cost of two extra passes.
+  function advectDye(dt) {
     const dw = dye.read.width, dh = dye.read.height;
-    gl.uniform2f(P.advect.u.texel, 1 / dw, 1 / dh);
+    const tx = 1 / dw, ty = 1 / dh;
+
+    // 1. Forward: the ordinary semi-Lagrangian step.
+    gl.useProgram(P.advect.p);
+    gl.uniform2f(P.advect.u.texel, tx, ty);
     gl.uniform1i(P.advect.u.uVelocity, velocity.read.attach(0));
     gl.uniform1i(P.advect.u.uSource, dye.read.attach(1));
+    gl.uniform1f(P.advect.u.dt, dt);
     gl.uniform1f(P.advect.u.dissipation, CFG.DENSITY_DISSIPATION);
+    blit(dyeScratch[0]);
+
+    // 2. Backward: advect that along +dt to find where it came from.
+    gl.useProgram(P.advectBack.p);
+    gl.uniform2f(P.advectBack.u.texel, tx, ty);
+    gl.uniform1i(P.advectBack.u.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(P.advectBack.u.uSource, dyeScratch[0].attach(1));
+    gl.uniform1f(P.advectBack.u.dt, dt);
+    blit(dyeScratch[1]);
+
+    // 3. Correct, clamped to the neighbourhood it was sampled from.
+    gl.useProgram(P.mccormack.p);
+    gl.uniform2f(P.mccormack.u.texel, tx, ty);
+    gl.uniform1i(P.mccormack.u.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(P.mccormack.u.uSource, dye.read.attach(1));
+    gl.uniform1i(P.mccormack.u.uForward, dyeScratch[0].attach(2));
+    gl.uniform1i(P.mccormack.u.uBackward, dyeScratch[1].attach(3));
+    gl.uniform1f(P.mccormack.u.dt, dt);
     blit(dye.write);
     dye.swap();
   }
