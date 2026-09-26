@@ -617,7 +617,9 @@
   }
 
   canvas.addEventListener('pointerdown', (e) => {
-    canvas.setPointerCapture?.(e.pointerId);
+    // Capture can throw if the pointer is already gone; losing capture is
+    // survivable, so never let it break the gesture.
+    try { canvas.setPointerCapture?.(e.pointerId); } catch (_) { /* non-fatal */ }
     pointers.set(e.pointerId, normalise(e));
     dismissHint();
   });
