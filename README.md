@@ -79,6 +79,45 @@ distinct hues on screen went up, because strokes stay separate colours instead
 of merging into one white smear. Worst case across every gesture tested
 (slow, fast flick, finger held in one spot, two-finger) is 4.5% white.
 
+## Multi-touch
+
+Any number of fingers work at once, up to whatever the hardware reports. Three
+details make it hold up:
+
+- **One stroke, many fingers.** The colour sweep is anchored when the first
+  finger lands, not per finger. Ten fingers anchoring separately restarted the
+  sweep ten times, so the hand averaged ten unrelated hues into grey.
+- **The hue sweep is per frame, not per splat.** Divided by the live finger
+  count, so the colour a stroke travels through in a second is the same whether
+  one finger is down or ten.
+- **Dye strength is normalised by finger count**, as `1/sqrt(n)`. Ten fingers
+  should paint ten times the area at the same intensity, not ten times the
+  pigment.
+
+`getCoalescedEvents` is used where available, so a 120Hz touch reports every
+sample rather than one per frame. Above two simultaneous fingers the MacCormack
+correction is skipped -- see below.
+
+## Why the page used to flash white
+
+MacCormack advection was the cause, and it was not obvious. The correction
+samples four neighbours and clamps the result to their range, and that clamp is
+a strong mixing operator. Under heavy input it repeatedly averaged neighbouring
+texels until R, G and B converged. The field then sat pinned at the dye ceiling
+with no hue left -- measured at a white frame: peak 1.096, minimum saturation
+0.000, 10,434 colourless texels -- and the tone-map rendered that as a white
+page.
+
+The correction is now blended in at 0.22 rather than applied at full strength,
+and skipped entirely above two fingers. Measured on the deployed build with ten
+fingers over 5.5 seconds: frames above white luma 27/46 before, 0/46 after.
+
+Two related fixes came out of the same investigation. Ambient drift now deposits
+22% of the dye a stroke does, because at full strength it repeatedly drove
+texels to the ceiling and went colourless the same way. And the quality
+governor samples the GPU once every 30 frames instead of every frame, because a
+per-frame `readPixels` stalls the pipeline enough to show as a hitch.
+
 ## Performance
 
 Four quality tiers scale dye, simulation, and bloom resolution together with
